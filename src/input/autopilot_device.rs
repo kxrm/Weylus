@@ -6,17 +6,106 @@ use autopilot::screen::size as screen_size;
 use tracing::warn;
 
 use crate::input::device::{InputDevice, InputDeviceType};
-use crate::protocol::{Button, KeyboardEvent, KeyboardEventType, PointerEvent, WheelEvent};
+use crate::protocol::{Button, KeyboardEvent, KeyboardEventType, PointerEvent, PointerEventType, WheelEvent};
 
 use crate::capturable::{Capturable, Geometry};
 
+#[cfg(target_os = "macos")]
+use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField};
+#[cfg(target_os = "macos")]
+use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+#[cfg(target_os = "macos")]
+use core_graphics::geometry::CGPoint;
+
+// Mouse event subtype for tablet point events
+#[cfg(target_os = "macos")]
+const MOUSE_EVENT_SUBTYPE_TABLET_POINT: i64 = 1;
+
+// Tablet pointer types
+#[cfg(target_os = "macos")]
+const TABLET_POINTER_TYPE_PEN: i64 = 1;
+
+// Capability mask bits from IOLLEvent.h - indicates what data the tablet provides
+// NX_TABLET_CAPABILITY_ABSXMASK = 0x0002
+// NX_TABLET_CAPABILITY_ABSYMASK = 0x0004
+// NX_TABLET_CAPABILITY_PRESSUREMASK = 0x0400
+#[cfg(target_os = "macos")]
+const TABLET_CAPABILITY_MASK: i64 = 0x0406; // X + Y + Pressure
+
+// Virtual device IDs (arbitrary but consistent)
+#[cfg(target_os = "macos")]
+const VIRTUAL_VENDOR_ID: i64 = 0x1234;
+#[cfg(target_os = "macos")]
+const VIRTUAL_TABLET_ID: i64 = 0x0001;
+#[cfg(target_os = "macos")]
+const VIRTUAL_DEVICE_ID: i64 = 1;
+
 pub struct AutoPilotDevice {
     capturable: Box<dyn Capturable>,
+    left_button_down: bool,
+    #[cfg(target_os = "macos")]
+    in_proximity: bool,
 }
 
 impl AutoPilotDevice {
     pub fn new(capturable: Box<dyn Capturable>) -> Self {
-        Self { capturable }
+        Self {
+            capturable,
+            left_button_down: false,
+            #[cfg(target_os = "macos")]
+            in_proximity: false,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn send_tablet_proximity_event(&self, entering: bool) {
+        if let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) {
+            if let Ok(event) = CGEvent::new(source) {
+                event.set_type(CGEventType::TabletProximity);
+
+                // Set proximity state (1 = entering, 0 = leaving)
+                event.set_integer_value_field(
+                    EventField::TABLET_PROXIMITY_EVENT_ENTER_PROXIMITY,
+                    if entering { 1 } else { 0 }
+                );
+
+                // Set device identification
+                event.set_integer_value_field(EventField::TABLET_PROXIMITY_EVENT_VENDOR_ID, VIRTUAL_VENDOR_ID);
+                event.set_integer_value_field(EventField::TABLET_PROXIMITY_EVENT_TABLET_ID, VIRTUAL_TABLET_ID);
+                event.set_integer_value_field(EventField::TABLET_PROXIMITY_EVENT_DEVICE_ID, VIRTUAL_DEVICE_ID);
+                event.set_integer_value_field(EventField::TABLET_PROXIMITY_EVENT_SYSTEM_TABLET_ID, VIRTUAL_DEVICE_ID);
+                event.set_integer_value_field(EventField::TABLET_PROXIMITY_EVENT_POINTER_ID, 1);
+
+                // Set pointer type to pen
+                event.set_integer_value_field(EventField::TABLET_PROXIMITY_EVENT_POINTER_TYPE, TABLET_POINTER_TYPE_PEN);
+                event.set_integer_value_field(EventField::TABLET_PROXIMITY_EVENT_VENDOR_POINTER_TYPE, TABLET_POINTER_TYPE_PEN);
+
+                // Set capability mask (indicates pressure support)
+                event.set_integer_value_field(EventField::TABLET_PROXIMITY_EVENT_CAPABILITY_MASK, TABLET_CAPABILITY_MASK);
+
+                event.post(CGEventTapLocation::HID);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn send_mouse_event(&self, event_type: CGEventType, x: f64, y: f64, pressure: f64) {
+        let point = CGPoint::new(x, y);
+        if let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) {
+            if let Ok(event) = CGEvent::new_mouse_event(source, event_type, point, CGMouseButton::Left) {
+                // Set tablet subtype for pen-like input
+                event.set_integer_value_field(EventField::MOUSE_EVENT_SUB_TYPE, MOUSE_EVENT_SUBTYPE_TABLET_POINT);
+
+                // Set pressure values
+                event.set_double_value_field(EventField::MOUSE_EVENT_PRESSURE, pressure);
+                event.set_double_value_field(EventField::TABLET_EVENT_POINT_PRESSURE, pressure);
+
+                // Link to the virtual tablet device
+                event.set_integer_value_field(EventField::TABLET_EVENT_DEVICE_ID, VIRTUAL_DEVICE_ID);
+
+                event.post(CGEventTapLocation::HID);
+            }
+        }
     }
 }
 
@@ -29,6 +118,68 @@ impl InputDevice for AutoPilotDevice {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn send_pointer_event(&mut self, event: &PointerEvent) {
+        if !event.is_primary {
+            return;
+        }
+        if let Err(err) = self.capturable.before_input() {
+            warn!("Failed to activate window, sending no input ({})", err);
+            return;
+        }
+        let (x_rel, y_rel, width_rel, height_rel) = match self.capturable.geometry().unwrap() {
+            Geometry::Relative(x, y, width, height) => (x, y, width, height),
+        };
+        let (_, _, width, height) = match crate::capturable::core_graphics::screen_coordsys() {
+            Ok(bounds) => bounds,
+            Err(err) => {
+                warn!("Could not determine global coordinate system: {}", err);
+                return;
+            }
+        };
+
+        let screen_x = (event.x * width_rel + x_rel) * width;
+        let screen_y = (event.y * height_rel + y_rel) * height;
+
+        // Use CoreGraphics directly for proper drag support on macOS
+        // Pressure from stylus (0.0 to 1.0)
+        let pressure = event.pressure;
+
+        match event.event_type {
+            PointerEventType::DOWN => {
+                if !self.left_button_down {
+                    // Send tablet proximity enter event before first touch
+                    if !self.in_proximity {
+                        self.in_proximity = true;
+                        self.send_tablet_proximity_event(true);
+                    }
+                    self.left_button_down = true;
+                    self.send_mouse_event(CGEventType::LeftMouseDown, screen_x, screen_y, pressure);
+                }
+            }
+            PointerEventType::UP | PointerEventType::CANCEL | PointerEventType::LEAVE | PointerEventType::OUT => {
+                if self.left_button_down {
+                    self.left_button_down = false;
+                    self.send_mouse_event(CGEventType::LeftMouseUp, screen_x, screen_y, 0.0);
+                    // Send tablet proximity leave event after pen lifts
+                    if self.in_proximity {
+                        self.in_proximity = false;
+                        self.send_tablet_proximity_event(false);
+                    }
+                }
+            }
+            PointerEventType::MOVE | PointerEventType::OVER | PointerEventType::ENTER => {
+                // Key fix: use LeftMouseDragged when button is held, MouseMoved otherwise
+                if self.left_button_down {
+                    self.send_mouse_event(CGEventType::LeftMouseDragged, screen_x, screen_y, pressure);
+                } else {
+                    self.send_mouse_event(CGEventType::MouseMoved, screen_x, screen_y, 0.0);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
     fn send_pointer_event(&mut self, event: &PointerEvent) {
         if !event.is_primary {
             return;
@@ -45,33 +196,28 @@ impl InputDevice for AutoPilotDevice {
                 return;
             }
         };
-        #[cfg(not(target_os = "macos"))]
         let Size { width, height } = screen_size();
-        #[cfg(target_os = "macos")]
-        let (_, _, width, height) = match crate::capturable::core_graphics::screen_coordsys() {
-            Ok(bounds) => bounds,
-            Err(err) => {
-                warn!("Could not determine global coordinate system: {}", err);
-                return;
-            }
-        };
         if let Err(err) = mouse::move_to(autopilot::geometry::Point::new(
             (event.x * width_rel + x_rel) * width,
             (event.y * height_rel + y_rel) * height,
         )) {
             warn!("Could not move mouse: {}", err);
         }
-        match event.button {
-            Button::PRIMARY => {
-                mouse::toggle(mouse::Button::Left, event.buttons.contains(event.button))
+
+        match event.event_type {
+            PointerEventType::DOWN => {
+                if !self.left_button_down {
+                    self.left_button_down = true;
+                    mouse::toggle(mouse::Button::Left, true);
+                }
             }
-            Button::AUXILARY => {
-                mouse::toggle(mouse::Button::Middle, event.buttons.contains(event.button))
+            PointerEventType::UP | PointerEventType::CANCEL | PointerEventType::LEAVE | PointerEventType::OUT => {
+                if self.left_button_down {
+                    self.left_button_down = false;
+                    mouse::toggle(mouse::Button::Left, false);
+                }
             }
-            Button::SECONDARY => {
-                mouse::toggle(mouse::Button::Right, event.buttons.contains(event.button))
-            }
-            _ => (),
+            _ => {}
         }
     }
 
